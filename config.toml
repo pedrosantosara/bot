@@ -1,0 +1,42 @@
+# Polymarket Copy Trading Bot - Configuration
+
+[simulation]
+# Wallets to monitor (add wallet addresses from leaderboard)
+target_wallets = []
+
+# How long to run simulation (hours)
+duration_hours = 48
+
+# Simulated capital in USDC
+simulated_capital = 500.0
+
+# Max USDC per single copy trade
+max_per_trade = 50.0
+
+# Estimated slippage percentage (how much worse your entry will be)
+slippage_estimate_pct = 2.0
+
+# Poll interval for checking new trades (seconds)
+poll_interval_secs = 5
+
+# Only copy trades in markets resolving within this many hours
+max_market_duration_hours = 168
+
+# Minimum trade size to copy (USDC) - ignore dust trades
+min_trade_size = 5.0
+
+[api]
+data_api_url = "https://data-api.polymarket.com"
+gamma_api_url = "https://gamma-api.polymarket.com"
+clob_api_url = "https://clob.polymarket.com"
+
+[filters]
+# Market categories to include (empty = all)
+# Options: CRYPTO, SPORTS, POLITICS, FINANCE, CULTURE, WEATHER, ECONOMICS, TECH
+categories = ["CRYPTO"]
+
+# Minimum market liquidity to consider
+min_liquidity = 1000.0
+
+# Maximum price drift allowed before skipping copy (percentage)
+max_price_drift_pct = 10.0

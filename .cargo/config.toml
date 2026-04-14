@@ -1,0 +1,2 @@
+# Intentionally empty — linker comes from Rust toolchain, dlltool from system PATH
+# C:\msys64\mingw64\bin was added to User PATH permanently
