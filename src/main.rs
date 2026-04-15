@@ -8,14 +8,17 @@ mod execution;
 mod models;
 mod report;
 mod simulator;
+mod telegram;
 mod web;
 
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use axum::{routing::{delete, get, post, put}, Router};
+use axum::{middleware, routing::{delete, get, post, put}, Router};
 use clap::{Parser, Subcommand};
 use tower_http::cors::CorsLayer;
+
+use crate::web::auth;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -34,6 +37,10 @@ struct Cli {
     /// Web server port
     #[arg(short, long, default_value = "3001")]
     port: u16,
+
+    /// Session password for web UI
+    #[arg(long, env = "BOT_PASSWORD", default_value = "polybot2026")]
+    password: String,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -86,7 +93,11 @@ async fn main() -> Result<()> {
                 .with(log_layer)
                 .init();
 
-            // Build API router
+            // Session auth
+            let session_store = auth::new_session_store();
+            let auth_state = (session_store.clone(), cli.password.clone());
+
+            // Build API router (protected by auth middleware)
             let api_router = Router::new()
                 // Config
                 .route("/config", get(web::routes::get_config))
@@ -110,10 +121,18 @@ async fn main() -> Result<()> {
                 // Analyze wallet
                 .route("/analyze/{wallet}", get(web::routes::analyze_wallet))
                 // BTC markets
-                .route("/markets/btc", get(web::routes::get_btc_markets));
+                .route("/markets/btc", get(web::routes::get_btc_markets))
+                .layer(middleware::from_fn_with_state(auth_state.clone(), auth::require_auth))
+                .with_state(state.clone());
+
+            // Login route (public, no auth required)
+            let login_router = Router::new()
+                .route("/api/login", post(auth::login))
+                .with_state(auth_state);
 
             let app = Router::new()
                 .nest("/api", api_router)
+                .merge(login_router)
                 .route("/ws", get(web::ws::ws_handler))
                 .layer(CorsLayer::permissive())
                 .with_state(state.clone());

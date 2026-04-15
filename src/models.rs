@@ -253,6 +253,8 @@ pub struct SimulatedCopy {
     pub slippage_bps: f64,      // (fill - intended) / intended * 10000
     #[serde(default)]
     pub strategy: String,       // "oracle-lag", "copy", "hedge", "mm"
+    #[serde(default)]
+    pub telegram_message_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

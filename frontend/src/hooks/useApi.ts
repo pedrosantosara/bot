@@ -1,10 +1,23 @@
 const BASE = '/api'
 
+function getToken(): string | null {
+  return localStorage.getItem('bot_token')
+}
+
 async function request<T>(path: string, opts?: RequestInit): Promise<T> {
+  const token = getToken()
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (token) headers['Authorization'] = `Bearer ${token}`
+
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     ...opts,
   })
+  if (res.status === 401) {
+    localStorage.removeItem('bot_token')
+    window.location.reload()
+    throw new Error('Unauthorized')
+  }
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }

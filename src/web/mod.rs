@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod log_layer;
 pub mod routes;
 pub mod ws;

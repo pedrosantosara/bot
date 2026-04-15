@@ -73,6 +73,11 @@ impl Simulator {
     pub async fn run(&mut self) -> Result<()> {
         info!(started_at = self.started_at, "Simulator starting — only trades AFTER this timestamp will be copied");
 
+        // Pre-warm TLS connections to avoid cold-start latency on first trade
+        info!("Warming up TLS connections to Polymarket APIs...");
+        crate::api::warmup_connections(&self.state.http_client).await;
+        info!("TLS connections warm");
+
         // Initialize real executor if in live mode
         let mode = self.state.db.get_bot_status().await
             .map(|s| s.mode).unwrap_or_else(|_| "test".to_string());
@@ -178,8 +183,10 @@ impl Simulator {
                 }
 
                 let ws_handle = self.run_ws_listener(&wallet_set);
+                let poll_handle = self.run_activity_poller(&wallets);
                 tokio::select! {
                     r = ws_handle => { if let Err(e) = r { error!(error = %e, "RTDS error"); } }
+                    r = poll_handle => { if let Err(e) = r { error!(error = %e, "Activity poller error"); } }
                     r = clob_handle => { if let Err(e) = r { error!(error = %e, "CLOB error"); } }
                     r = resolve_handle => { if let Err(e) = r { error!(error = %e, "Resolution error"); } }
                     r = balance_handle => { if let Err(e) = r { error!(error = %e, "Balance tracker error"); } }
@@ -663,6 +670,7 @@ impl Simulator {
                     latency_exec_ms,
                     slippage_bps,
                     strategy: "oracle-lag".to_string(),
+                    telegram_message_id: 0,
                 };
 
                 let id = self.state.db.insert_copy(&copy).await.unwrap_or(0);
@@ -886,6 +894,7 @@ impl Simulator {
                     signal_ts: 0, orderbook_ts: 0, order_sent_ts: 0, order_filled_ts: 0,
                     intended_price: 0.0, fill_price: 0.0, latency_total_ms: 0, latency_exec_ms: 0, slippage_bps: 0.0,
                     strategy: "hedge".to_string(),
+                    telegram_message_id: 0,
                     };
                     let id_0 = self.state.db.insert_copy(&copy_0).await.unwrap_or(0);
 
@@ -915,6 +924,7 @@ impl Simulator {
                     signal_ts: 0, orderbook_ts: 0, order_sent_ts: 0, order_filled_ts: 0,
                     intended_price: 0.0, fill_price: 0.0, latency_total_ms: 0, latency_exec_ms: 0, slippage_bps: 0.0,
                     strategy: "hedge".to_string(),
+                    telegram_message_id: 0,
                     };
                     let id_1 = self.state.db.insert_copy(&copy_1).await.unwrap_or(0);
 
@@ -1205,6 +1215,7 @@ impl Simulator {
                     signal_ts: 0, orderbook_ts: 0, order_sent_ts: 0, order_filled_ts: 0,
                     intended_price: 0.0, fill_price: 0.0, latency_total_ms: 0, latency_exec_ms: 0, slippage_bps: 0.0,
                     strategy: "mm".to_string(),
+                    telegram_message_id: 0,
                     };
                     let id = self.state.db.insert_copy(&copy).await.unwrap_or(0);
                     self.open_market_slugs.lock().await.insert(slug.clone(), outcome_up.clone());
@@ -1266,6 +1277,7 @@ impl Simulator {
                     signal_ts: 0, orderbook_ts: 0, order_sent_ts: 0, order_filled_ts: 0,
                     intended_price: 0.0, fill_price: 0.0, latency_total_ms: 0, latency_exec_ms: 0, slippage_bps: 0.0,
                     strategy: "mm".to_string(),
+                    telegram_message_id: 0,
                     };
                     let id = self.state.db.insert_copy(&copy).await.unwrap_or(0);
                     if !self.open_market_slugs.lock().await.contains_key(&slug) {
@@ -1308,16 +1320,19 @@ impl Simulator {
             }
             first = false;
 
-            // Get wallet address from executor or env
-            let address = if let Some(ref exec) = self.executor {
-                exec.address.clone()
-            } else {
-                // test mode — try env
-                match std::env::var("POLYMARKET_ADDRESS") {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                }
-            };
+            // Get wallet address: prefer POLYMARKET_WALLET env (profile address),
+            // because exec.address is the signer address which differs from the
+            // Polymarket profile address used by the Data API.
+            let address = std::env::var("POLYMARKET_WALLET")
+                .or_else(|_| std::env::var("POLYMARKET_ADDRESS"))
+                .unwrap_or_else(|_| {
+                    if let Some(ref exec) = self.executor {
+                        exec.address.clone()
+                    } else {
+                        String::new()
+                    }
+                });
+            if address.is_empty() { continue; }
 
             // Fetch USDC balance from Polymarket Data API
             let url = format!(
@@ -1412,6 +1427,161 @@ impl Simulator {
             Some((tokens[0].clone(), tokens[1].clone(), outcomes[0].clone(), outcomes[1].clone()))
         } else {
             None
+        }
+    }
+
+    // ── Activity Poller (catches trades RTDS misses due to proxy wallet mismatch) ──
+
+    async fn run_activity_poller(&self, wallets: &[crate::models::TrackedWallet]) -> Result<()> {
+        let enabled_count = wallets.iter().filter(|w| w.enabled).count();
+        // Data API limit: 1000 req/10s general. Stay well under at max 50 req/10s.
+        // With N wallets polling every cycle, interval = max(2s, N * 400ms)
+        // 3 wallets → 2s cycle (1.5 req/s = 15/10s)
+        // 10 wallets → 4s cycle (2.5 req/s = 25/10s)
+        // 25 wallets → 10s cycle (2.5 req/s = 25/10s)
+        let cycle_ms = (enabled_count as u64 * 400).max(2000);
+        let per_wallet_delay = tokio::time::Duration::from_millis(
+            if enabled_count > 1 { 200 } else { 0 }
+        );
+
+        info!(
+            count = enabled_count,
+            cycle_ms = cycle_ms,
+            "Activity poller started (rate-safe: ~{:.0} req/10s)",
+            (enabled_count as f64 / (cycle_ms as f64 / 1000.0)) * 10.0
+        );
+
+        let mut consecutive_errors: u32 = 0;
+
+        loop {
+            if !*self.state.bot_running.read().await {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                consecutive_errors = 0;
+                continue;
+            }
+
+            // Backoff on consecutive errors to avoid hammering a down API
+            if consecutive_errors > 5 {
+                let backoff = (consecutive_errors as u64).min(30) * 2;
+                warn!(errors = consecutive_errors, backoff_secs = backoff, "Activity API errors, backing off");
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+            }
+
+            let mut cycle_had_error = false;
+
+            for wallet in wallets {
+                if !wallet.enabled { continue; }
+
+                let url = format!(
+                    "https://data-api.polymarket.com/activity?user={}&limit=5&type=TRADE&sortBy=TIMESTAMP&sortDirection=DESC",
+                    wallet.address
+                );
+
+                let resp = match self.state.http_client.get(&url)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send().await
+                {
+                    Ok(r) => {
+                        // Check for rate limit response
+                        if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                            warn!("Activity API rate limited (429) — backing off");
+                            consecutive_errors += 10;
+                            cycle_had_error = true;
+                            break;
+                        }
+                        if !r.status().is_success() {
+                            cycle_had_error = true;
+                            continue;
+                        }
+                        r
+                    }
+                    Err(_) => {
+                        cycle_had_error = true;
+                        continue;
+                    }
+                };
+
+                let activities: Vec<serde_json::Value> = match resp.json().await {
+                    Ok(a) => a,
+                    Err(_) => {
+                        cycle_had_error = true;
+                        continue;
+                    }
+                };
+
+                for activity in &activities {
+                    let tx_hash = activity.get("transactionHash")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if tx_hash.is_empty() { continue; }
+
+                    // Skip if already seen
+                    {
+                        let seen = self.seen_tx_hashes.lock().await;
+                        if seen.contains(tx_hash) { continue; }
+                    }
+
+                    // Check timestamp
+                    let mut trade_ts = activity.get("timestamp")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    if trade_ts > 1_000_000_000_000 { trade_ts /= 1000; }
+                    if trade_ts < self.started_at { continue; }
+
+                    self.seen_tx_hashes.lock().await.insert(tx_hash.to_string());
+
+                    let trade = WalletTrade {
+                        proxy_wallet: wallet.address.clone(),
+                        side: activity.get("side").and_then(|v| v.as_str()).unwrap_or("BUY").to_string(),
+                        asset: activity.get("asset").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        condition_id: activity.get("conditionId")
+                            .and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        size: activity.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        price: activity.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        timestamp: trade_ts,
+                        title: activity.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        slug: activity.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        event_slug: activity.get("eventSlug").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        outcome: activity.get("outcome").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        outcome_index: activity.get("outcomeIndex")
+                            .and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        transaction_hash: tx_hash.to_string(),
+                    };
+
+                    info!(
+                        wallet = %wallet.label,
+                        side = %trade.side,
+                        market = %trade.title,
+                        outcome = %trade.outcome,
+                        price = trade.price,
+                        "Activity poller: new trade detected"
+                    );
+
+                    let max_per_trade = self.get_config_f64("max_per_trade").await.unwrap_or(5.0);
+                    let min_trade_size = self.get_config_f64("min_trade_size").await.unwrap_or(5.0);
+                    let slippage_pct = self.get_config_f64("slippage_estimate_pct").await.unwrap_or(2.0);
+                    let max_drift_pct = self.get_config_f64("max_price_drift_pct").await.unwrap_or(10.0);
+                    let mode = self.state.db.get_bot_status().await
+                        .map(|s| s.mode).unwrap_or_else(|_| "test".to_string());
+
+                    if let Err(e) = self.process_trade(&trade, &mode, min_trade_size, max_per_trade, slippage_pct, max_drift_pct).await {
+                        warn!(error = %e, "Error processing polled trade");
+                    }
+                }
+
+                // Small delay between wallets to spread requests
+                if per_wallet_delay > tokio::time::Duration::ZERO {
+                    tokio::time::sleep(per_wallet_delay).await;
+                }
+            }
+
+            if cycle_had_error {
+                consecutive_errors += 1;
+            } else {
+                consecutive_errors = 0;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(cycle_ms)).await;
         }
     }
 
@@ -1925,9 +2095,27 @@ impl Simulator {
             // Allow non-5m markets too (hourly, daily) — copy everything
         }
 
-        // Capital check only
+        // Deduplicate: only copy once per market (condition_id + outcome + wallet).
+        // Whales often fill in many small transactions — we only want one entry.
+        {
+            let dedup_key = format!("{}:{}:{}", trade.condition_id, trade.outcome, trade.proxy_wallet);
+            let already_copied = self.open_market_slugs.lock().await
+                .values()
+                .any(|v| v == &dedup_key);
+            if already_copied {
+                return Ok(());
+            }
+        }
+
+        // Capital check
         let balance = self.state.db.get_balance_info().await?;
         if balance.available_capital < max_per_trade {
+            warn!(
+                available = balance.available_capital,
+                needed = max_per_trade,
+                market = %trade.title,
+                "Skipping trade — insufficient capital"
+            );
             return Ok(());
         }
 
@@ -1938,26 +2126,39 @@ impl Simulator {
         if sim_size_shares < 5.0 { sim_size_shares = 5.0; }
         let sim_cost = sim_size_shares * sim_entry_price;
 
+        // Execute order on CLOB — only record in DB if order succeeds
+        let mut order_ok = true;
+        if let Some(ref exec) = self.executor {
+            if !trade.asset.is_empty() {
+                match exec.buy_limit(&trade.asset, sim_size_shares, sim_entry_price).await {
+                    Ok(r) if r.success => {}
+                    Ok(_) => {
+                        warn!(market = %trade.title, "Copy order not filled — not recording");
+                        order_ok = false;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, market = %trade.title, "Copy order error — not recording");
+                        order_ok = false;
+                    }
+                }
+            }
+        }
+
+        if !order_ok {
+            return Ok(());
+        }
+
         let mut copy = self.build_copy(trade, sim_entry_price, sim_size_shares, sim_cost, mode, "OPEN");
         if copy.market_slug.is_empty() && !market_key.is_empty() {
             copy.market_slug = market_key.clone();
         }
 
-        // Execute real order if in live mode — use limit order at their price
-        if let Some(ref exec) = self.executor {
-            if !trade.asset.is_empty() {
-                match exec.buy_limit(&trade.asset, sim_size_shares, sim_entry_price).await {
-                    Ok(r) if r.success => {}
-                    Ok(_) => { warn!("Copy order not filled"); }
-                    Err(e) => { warn!(error = %e, "Copy order error"); }
-                }
-            }
-        }
-
         let id = self.state.db.insert_copy(&copy).await?;
 
-        if !market_key.is_empty() {
-            self.open_market_slugs.lock().await.insert(market_key.clone(), trade.outcome.clone());
+        {
+            let dedup_key = format!("{}:{}:{}", trade.condition_id, trade.outcome, trade.proxy_wallet);
+            let key = if !market_key.is_empty() { market_key.clone() } else { dedup_key.clone() };
+            self.open_market_slugs.lock().await.insert(key, dedup_key);
         }
         if !trade.asset.is_empty() {
             self.subscribed_assets.lock().await.insert(trade.asset.clone());
@@ -1983,12 +2184,40 @@ impl Simulator {
         copy_with_id.id = id;
         self.state.broadcast(WsEvent::TradeDetected(copy_with_id));
 
-        if let Ok(stats) = self.state.db.get_trade_stats(None).await {
-            self.state.broadcast(WsEvent::StatsUpdate(stats));
-        }
-        if let Ok(bal) = self.state.db.get_balance_info().await {
-            self.state.broadcast(WsEvent::BalanceUpdate(bal));
-        }
+        // Stats/balance + Telegram notification in background (not blocking next trade)
+        let bg_state = self.state.clone();
+        let tg_wallet = trade.proxy_wallet.clone();
+        let tg_outcome = trade.outcome.clone();
+        let tg_market = trade.title.clone();
+        let tg_price = sim_entry_price;
+        let tg_whale_price = trade.price;
+        let tg_cost = sim_cost;
+        let tg_mode = mode.to_string();
+        let tg_copy_id = id;
+        tokio::spawn(async move {
+            if let Ok(stats) = bg_state.db.get_trade_stats(None).await {
+                bg_state.broadcast(WsEvent::StatsUpdate(stats));
+            }
+            if let Ok(bal) = bg_state.db.get_balance_info().await {
+                bg_state.broadcast(WsEvent::BalanceUpdate(bal));
+            }
+            // Telegram notification — save message_id for later editing on resolution
+            if let Some(ref tg) = bg_state.telegram {
+                let label = bg_state.db.get_wallets().await
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|w| w.address.eq_ignore_ascii_case(&tg_wallet))
+                    .map(|w| w.label.clone())
+                    .unwrap_or_else(|| format!("{}...{}", &tg_wallet[..6], &tg_wallet[tg_wallet.len()-4..]));
+                let msg = crate::telegram::format_entry(
+                    &label, &tg_outcome, &tg_market, tg_cost, tg_price, tg_whale_price, &tg_mode,
+                );
+                let msg_id = tg.send(&msg).await;
+                if msg_id > 0 {
+                    let _ = bg_state.db.set_telegram_message_id(tg_copy_id, msg_id).await;
+                }
+            }
+        });
 
         Ok(())
     }
@@ -2018,6 +2247,8 @@ impl Simulator {
             self.open_market_slugs.lock().await.remove(market_key);
         }
 
+        let mut tg_msgs: Vec<String> = Vec::new();
+
         for c in &matching {
             // P&L = (exit_price * shares) - cost
             let exit_value = exit_price * c.sim_size_shares;
@@ -2044,6 +2275,10 @@ impl Simulator {
                 );
             }
 
+            tg_msgs.push(crate::telegram::format_exit(
+                &c.market_title, &c.outcome, exit_price, pnl, "Whale vendeu",
+            ));
+
             let mut resolved = (*c).clone();
             resolved.market_resolved = true;
             resolved.winning_outcome = Some(format!("SOLD@{:.3}", exit_price));
@@ -2062,6 +2297,16 @@ impl Simulator {
         }
         if let Ok(bal) = self.state.db.get_balance_info().await {
             self.state.broadcast(WsEvent::BalanceUpdate(bal));
+        }
+
+        // Telegram in background
+        if !tg_msgs.is_empty() {
+            let bg_state = self.state.clone();
+            tokio::spawn(async move {
+                if let Some(ref tg) = bg_state.telegram {
+                    tg.send_batch(&tg_msgs).await;
+                }
+            });
         }
 
         Ok(())
@@ -2101,6 +2346,7 @@ impl Simulator {
             signal_ts: 0, orderbook_ts: 0, order_sent_ts: 0, order_filled_ts: 0,
             intended_price: 0.0, fill_price: 0.0, latency_total_ms: 0, latency_exec_ms: 0, slippage_bps: 0.0,
             strategy: "copy".to_string(),
+            telegram_message_id: 0,
         }
     }
 
@@ -2115,6 +2361,7 @@ impl Simulator {
 
         let mut closed_count = 0u32;
         let mut checked_keys: HashSet<String> = HashSet::new();
+        let mut tg_messages: Vec<String> = Vec::new();
 
         for copy in open_copies {
             let market_key = self.market_key_from_copy(copy);
@@ -2181,6 +2428,10 @@ impl Simulator {
                             format!("whale saiu offline #{}", c.id).dimmed(),
                         );
 
+                        tg_messages.push(crate::telegram::format_exit(
+                            &c.market_title, &c.outcome, exit_price, pnl, "Whale saiu (offline)",
+                        ));
+
                         let mut resolved = c.clone();
                         resolved.market_resolved = true;
                         resolved.winning_outcome = Some("WHALE_EXITED_OFFLINE".to_string());
@@ -2221,6 +2472,12 @@ impl Simulator {
             }
             if let Ok(bal) = self.state.db.get_balance_info().await {
                 self.state.broadcast(WsEvent::BalanceUpdate(bal));
+            }
+            // Send Telegram notifications in batch
+            if !tg_messages.is_empty() {
+                if let Some(ref tg) = self.state.telegram {
+                    tg.send_batch(&tg_messages).await;
+                }
             }
         } else {
             info!("Startup sync: all open positions still active");
@@ -2271,6 +2528,8 @@ impl Simulator {
         let now_ts = Utc::now().timestamp();
         let mut checked_keys: HashSet<String> = HashSet::new();
         let mut any_resolved = false;
+        let mut tg_messages: Vec<String> = Vec::new();
+        let mut tg_edits: Vec<(i64, String)> = Vec::new();
 
         for copy in &open {
             let market_key = self.market_key_from_copy(copy);
@@ -2293,7 +2552,7 @@ impl Simulator {
                 let bot_position = self.check_tracked_position(&copy.whale_wallet, &copy.market_slug).await;
                 match bot_position {
                     TrackedPosition::Exited => {
-                        self.close_as_bot_exit(&open, &market_key, copy).await;
+                        self.close_as_bot_exit(&open, &market_key, copy, &mut tg_messages).await;
                         any_resolved = true;
                     }
                     TrackedPosition::Resolved => {
@@ -2357,6 +2616,30 @@ impl Simulator {
                         );
                     }
 
+                    // Telegram: edit original entry message with result, or send new if no message_id
+                    if c.telegram_message_id > 0 {
+                        // Get wallet label for the edited message
+                        let wallet_label = self.state.db.get_wallets().await
+                            .unwrap_or_default()
+                            .iter()
+                            .find(|w| w.address.eq_ignore_ascii_case(&c.whale_wallet))
+                            .map(|w| w.label.clone())
+                            .unwrap_or_else(|| {
+                                let w = &c.whale_wallet;
+                                format!("{}...{}", &w[..6.min(w.len())], &w[w.len().saturating_sub(4)..])
+                            });
+                        let edited_msg = crate::telegram::format_entry_resolved(
+                            &wallet_label, &c.outcome, &c.market_title,
+                            c.sim_cost_usdc, c.sim_entry_price, c.whale_price,
+                            &c.mode, winner_outcome, pnl, won,
+                        );
+                        tg_edits.push((c.telegram_message_id, edited_msg));
+                    } else {
+                        tg_messages.push(crate::telegram::format_resolution(
+                            &c.market_title, &c.outcome, winner_outcome, pnl, won,
+                        ));
+                    }
+
                     let mut resolved = c.clone();
                     resolved.market_resolved = true;
                     resolved.winning_outcome = Some(winner_outcome.clone());
@@ -2374,6 +2657,17 @@ impl Simulator {
             }
             if let Ok(balance) = self.state.db.get_balance_info().await {
                 self.state.broadcast(WsEvent::BalanceUpdate(balance));
+            }
+        }
+
+        // Telegram: edit original messages with results
+        if let Some(ref tg) = self.state.telegram {
+            for (msg_id, text) in &tg_edits {
+                tg.edit(*msg_id, text).await;
+            }
+            // Fallback: send new messages for trades without telegram_message_id
+            if !tg_messages.is_empty() {
+                tg.send_batch(&tg_messages).await;
             }
         }
 
@@ -2429,7 +2723,7 @@ impl Simulator {
     }
 
     /// Whale exited early — close our position at estimated price
-    async fn close_as_bot_exit(&self, open: &[SimulatedCopy], market_key: &str, _copy: &SimulatedCopy) {
+    async fn close_as_bot_exit(&self, open: &[SimulatedCopy], market_key: &str, _copy: &SimulatedCopy, tg_messages: &mut Vec<String>) {
         self.open_market_slugs.lock().await.remove(market_key);
 
         for c in open.iter().filter(|c2| self.market_key_from_copy(c2) == market_key) {
@@ -2454,6 +2748,10 @@ impl Simulator {
                 pnl_str,
                 format!("bot saiu #{}", c.id).dimmed(),
             );
+
+            tg_messages.push(crate::telegram::format_exit(
+                &c.market_title, &c.outcome, exit_price, pnl, "Whale saiu",
+            ));
 
             let mut resolved = c.clone();
             resolved.market_resolved = true;

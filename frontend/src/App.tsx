@@ -6,12 +6,18 @@ import { LiveFeed } from './components/LiveFeed'
 import { Settings } from './components/Settings'
 import { Analyze } from './components/Analyze'
 import { LogViewer } from './components/LogViewer'
+import { Login } from './components/Login'
 import { useWebSocket } from './hooks/useWebSocket'
 import { api } from './hooks/useApi'
 
 type Tab = 'dashboard' | 'analyze' | 'history' | 'logs' | 'settings'
 
 export default function App() {
+  const [token, setToken] = useState<string | null>(localStorage.getItem('bot_token'))
+
+  if (!token) {
+    return <Login onLogin={(t) => setToken(t)} />
+  }
   const [tab, setTab] = useState<Tab>('dashboard')
   const [stats, setStats] = useState<any>(null)
   const [balance, setBalance] = useState<any>(null)

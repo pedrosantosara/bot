@@ -186,6 +186,15 @@ impl Database {
         Ok(())
     }
 
+    pub async fn set_telegram_message_id(&self, id: i32, message_id: i64) -> Result<()> {
+        sqlx::query("UPDATE simulated_copies SET telegram_message_id = $2 WHERE id = $1")
+            .bind(id)
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_open_copies(&self) -> Result<Vec<SimulatedCopy>> {
         let copies = sqlx::query_as::<_, SimulatedCopy>(
             "SELECT id, whale_wallet, whale_tx_hash, market_slug, market_title,
@@ -194,7 +203,7 @@ impl Database {
                     sim_cost_usdc, detection_time, market_resolved,
                     winning_outcome, sim_pnl, status, mode, created_at,
                     signal_ts, orderbook_ts, order_sent_ts, order_filled_ts,
-                    intended_price, fill_price, latency_total_ms, latency_exec_ms, slippage_bps, strategy
+                    intended_price, fill_price, latency_total_ms, latency_exec_ms, slippage_bps, strategy, telegram_message_id
              FROM simulated_copies WHERE status = 'OPEN' ORDER BY created_at DESC"
         )
         .fetch_all(&self.pool)
@@ -211,7 +220,7 @@ impl Database {
                         sim_cost_usdc, detection_time, market_resolved,
                         winning_outcome, sim_pnl, status, mode, created_at,
                     signal_ts, orderbook_ts, order_sent_ts, order_filled_ts,
-                    intended_price, fill_price, latency_total_ms, latency_exec_ms, slippage_bps, strategy
+                    intended_price, fill_price, latency_total_ms, latency_exec_ms, slippage_bps, strategy, telegram_message_id
                  FROM simulated_copies WHERE mode = $3
                  ORDER BY created_at DESC LIMIT $1 OFFSET $2"
             )
@@ -228,7 +237,7 @@ impl Database {
                         sim_cost_usdc, detection_time, market_resolved,
                         winning_outcome, sim_pnl, status, mode, created_at,
                     signal_ts, orderbook_ts, order_sent_ts, order_filled_ts,
-                    intended_price, fill_price, latency_total_ms, latency_exec_ms, slippage_bps, strategy
+                    intended_price, fill_price, latency_total_ms, latency_exec_ms, slippage_bps, strategy, telegram_message_id
                  FROM simulated_copies
                  ORDER BY created_at DESC LIMIT $1 OFFSET $2"
             )
@@ -315,10 +324,18 @@ impl Database {
     // ── Balance Info ──
 
     pub async fn get_balance_info(&self) -> Result<crate::models::BalanceInfo> {
-        // Get initial capital from config
-        let capital_val = self.get_config("simulated_capital").await?
+        // Prefer real USDC balance (fetched by balance tracker from Polymarket API)
+        // over the manually-set simulated_capital config value.
+        let capital_val = self.get_config("real_usdc_balance").await?
             .and_then(|v| v.as_f64())
-            .unwrap_or(500.0);
+            .unwrap_or_else(|| 0.0);
+        let capital_val = if capital_val > 0.0 {
+            capital_val
+        } else {
+            self.get_config("simulated_capital").await?
+                .and_then(|v| v.as_f64())
+                .unwrap_or(500.0)
+        };
 
         let row = sqlx::query(
             "SELECT
