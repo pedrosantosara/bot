@@ -94,9 +94,17 @@ impl Simulator {
 
         // Load open market keys + asset IDs from DB
         if let Ok(open_copies) = self.state.db.get_open_copies().await {
+            // First: sync with tracked wallets — close positions where the whale already exited
+            if !open_copies.is_empty() {
+                info!(count = open_copies.len(), "Checking open positions against tracked wallets on startup...");
+                self.sync_open_positions_on_startup(&open_copies).await;
+            }
+
+            // Reload after sync (some may have been closed)
+            let remaining = self.state.db.get_open_copies().await.unwrap_or_default();
             let mut open_mkts = self.open_market_slugs.lock().await;
             let mut assets = self.subscribed_assets.lock().await;
-            for copy in &open_copies {
+            for copy in &remaining {
                 let key = self.market_key_from_copy(copy);
                 if !key.is_empty() {
                     open_mkts.insert(key, copy.outcome.clone());
@@ -2093,6 +2101,154 @@ impl Simulator {
             signal_ts: 0, orderbook_ts: 0, order_sent_ts: 0, order_filled_ts: 0,
             intended_price: 0.0, fill_price: 0.0, latency_total_ms: 0, latency_exec_ms: 0, slippage_bps: 0.0,
             strategy: "copy".to_string(),
+        }
+    }
+
+    // ── Startup Position Sync ──
+    // When the bot restarts, check every OPEN position to see if the tracked
+    // wallet already exited while we were offline.  If so, close ours too —
+    // in live mode we execute a real SELL, in test mode we just mark resolved.
+
+    async fn sync_open_positions_on_startup(&self, open_copies: &[SimulatedCopy]) {
+        let mode = self.state.db.get_bot_status().await
+            .map(|s| s.mode).unwrap_or_else(|_| "test".to_string());
+
+        let mut closed_count = 0u32;
+        let mut checked_keys: HashSet<String> = HashSet::new();
+
+        for copy in open_copies {
+            let market_key = self.market_key_from_copy(copy);
+            if market_key.is_empty() || checked_keys.contains(&market_key) {
+                continue;
+            }
+            checked_keys.insert(market_key.clone());
+
+            // Check if the whale still holds this position
+            let position = self.check_tracked_position(&copy.whale_wallet, &copy.market_slug).await;
+
+            match position {
+                TrackedPosition::Exited => {
+                    // Whale exited while bot was offline — close our position
+                    info!(
+                        market = %copy.market_title,
+                        wallet = %copy.whale_wallet,
+                        "Whale exited while bot was offline — closing position"
+                    );
+
+                    // Try to get current orderbook price for a better exit estimate
+                    let exit_price = self.get_current_exit_price(copy).await
+                        .unwrap_or(copy.sim_entry_price * 0.95);
+
+                    // In live mode, execute real sell order
+                    if mode == "live" {
+                        if let Some(ref executor) = self.executor {
+                            if !copy.asset_id.is_empty() {
+                                match executor.sell(&copy.asset_id, copy.sim_size_shares, exit_price).await {
+                                    Ok(result) if result.success => {
+                                        info!(copy_id = copy.id, "Live SELL executed on startup sync");
+                                    }
+                                    Ok(_) => {
+                                        warn!(copy_id = copy.id, "Live SELL failed — marking as bot exit");
+                                    }
+                                    Err(e) => {
+                                        warn!(copy_id = copy.id, error = %e, "Live SELL error — marking as bot exit");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Close all copies for this market key
+                    for c in open_copies.iter().filter(|c2| self.market_key_from_copy(c2) == market_key) {
+                        let exit_value = exit_price * c.sim_size_shares;
+                        let pnl = exit_value - c.sim_cost_usdc;
+
+                        let _ = self.state.db.resolve_copy(c.id, "WHALE_EXITED_OFFLINE", pnl).await;
+                        closed_count += 1;
+
+                        let short_market = Self::short_market(&c.market_title);
+                        let pnl_str = if pnl >= 0.0 {
+                            format!("+${:.2}", pnl).green().bold()
+                        } else {
+                            format!("-${:.2}", pnl.abs()).red().bold()
+                        };
+                        println!("{} {} {} @{:.3} {} {}",
+                            "◀ SYNC".yellow().bold(),
+                            c.outcome.white(),
+                            short_market.cyan(),
+                            exit_price,
+                            pnl_str,
+                            format!("whale saiu offline #{}", c.id).dimmed(),
+                        );
+
+                        let mut resolved = c.clone();
+                        resolved.market_resolved = true;
+                        resolved.winning_outcome = Some("WHALE_EXITED_OFFLINE".to_string());
+                        resolved.sim_pnl = Some(pnl);
+                        resolved.status = "RESOLVED".to_string();
+                        self.state.broadcast(WsEvent::TradeResolved(resolved));
+                    }
+                }
+                TrackedPosition::Resolved => {
+                    info!(
+                        market = %copy.market_title,
+                        "Market resolved while bot was offline — will be handled by resolution loop"
+                    );
+                }
+                TrackedPosition::StillHolding => {
+                    info!(
+                        market = %Self::short_market(&copy.market_title),
+                        wallet = %&copy.whale_wallet[..8],
+                        "Whale still holding — keeping position open"
+                    );
+                }
+                TrackedPosition::Unknown => {
+                    warn!(
+                        market = %copy.market_title,
+                        "Could not check whale position — keeping open, will retry in resolution loop"
+                    );
+                }
+            }
+
+            // Small delay to avoid rate-limiting the API
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        }
+
+        if closed_count > 0 {
+            info!(closed = closed_count, "Startup sync: closed positions where whale exited offline");
+            if let Ok(stats) = self.state.db.get_trade_stats(None).await {
+                self.state.broadcast(WsEvent::StatsUpdate(stats));
+            }
+            if let Ok(bal) = self.state.db.get_balance_info().await {
+                self.state.broadcast(WsEvent::BalanceUpdate(bal));
+            }
+        } else {
+            info!("Startup sync: all open positions still active");
+        }
+    }
+
+    /// Try to get a realistic exit price from the orderbook
+    async fn get_current_exit_price(&self, copy: &SimulatedCopy) -> Option<f64> {
+        if copy.asset_id.is_empty() {
+            return None;
+        }
+        // Get best bid from orderbook as exit price
+        let url = format!(
+            "https://clob.polymarket.com/book?token_id={}",
+            urlencoding::encode(&copy.asset_id)
+        );
+        let resp = self.state.http_client.get(&url).send().await.ok()?;
+        let book: serde_json::Value = resp.json().await.ok()?;
+        let best_bid = book.get("bids")?
+            .as_array()?
+            .first()?
+            .get("price")?
+            .as_str()?
+            .parse::<f64>().ok()?;
+        if best_bid > 0.01 {
+            Some(best_bid)
+        } else {
+            None
         }
     }
 

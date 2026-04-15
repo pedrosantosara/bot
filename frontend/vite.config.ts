@@ -17,13 +17,28 @@ export default defineConfig({
         ws: true,
         changeOrigin: true,
         rewriteWsOrigin: true,
-        // Suppress ECONNRESET/ECONNABORTED on page reload — harmless noise
         configure: (proxy) => {
           proxy.on('error', () => {})
           proxy.on('proxyReqWs', (_proxyReq, _req, socket) => {
             socket.on('error', () => {})
           })
         },
+      },
+    },
+  },
+  preview: {
+    port: 5173,
+    host: '0.0.0.0',
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+      },
+      '/ws': {
+        target: 'http://localhost:3001',
+        ws: true,
+        changeOrigin: true,
+        rewriteWsOrigin: true,
       },
     },
   },
