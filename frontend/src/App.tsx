@@ -5,10 +5,11 @@ import { BotControl } from './components/BotControl'
 import { LiveFeed } from './components/LiveFeed'
 import { Settings } from './components/Settings'
 import { Analyze } from './components/Analyze'
+import { LogViewer } from './components/LogViewer'
 import { useWebSocket } from './hooks/useWebSocket'
 import { api } from './hooks/useApi'
 
-type Tab = 'dashboard' | 'analyze' | 'history' | 'settings'
+type Tab = 'dashboard' | 'analyze' | 'history' | 'logs' | 'settings'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('dashboard')
@@ -17,6 +18,7 @@ export default function App() {
   const [trades, setTrades] = useState<any[]>([])
   const [botStatus, setBotStatus] = useState<any>(null)
   const [liveEvents, setLiveEvents] = useState<any[]>([])
+  const [logs, setLogs] = useState<any[]>([])
   const [stopResults, setStopResults] = useState<any>(null)
 
   const handleWsMessage = useCallback((event: any) => {
@@ -32,6 +34,8 @@ export default function App() {
     } else if (event.type === 'TradeDetected' || event.type === 'TradeResolved') {
       setLiveEvents(prev => [event, ...prev].slice(0, 50))
       loadData()
+    } else if (event.type === 'LogEntry') {
+      setLogs(prev => [...prev, event.data].slice(-2000))
     }
   }, [])
 
@@ -71,6 +75,7 @@ export default function App() {
     { id: 'dashboard', label: 'Dashboard' },
     { id: 'analyze', label: 'Analyze' },
     { id: 'history', label: 'History' },
+    { id: 'logs', label: 'Logs' },
     { id: 'settings', label: 'Settings' },
   ]
 
@@ -230,6 +235,8 @@ export default function App() {
             <TradesTable trades={trades} />
           </div>
         )}
+
+        {tab === 'logs' && <LogViewer logs={logs} />}
 
         {tab === 'settings' && <Settings onAnalyze={(w) => { setTab('analyze'); (window as any).__analyzeWallet = w }} />}
       </main>

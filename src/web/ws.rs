@@ -35,6 +35,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         if sender.send(Message::Text(msg.into())).await.is_err() { return; }
     }
 
+    // Send recent logs
+    let recent_logs = state.recent_logs().await;
+    for entry in recent_logs {
+        let msg = serde_json::to_string(&crate::models::WsEvent::LogEntry(entry)).unwrap_or_default();
+        if sender.send(Message::Text(msg.into())).await.is_err() { return; }
+    }
+
     // Forward broadcast events to this client
     let send_task = tokio::spawn(async move {
         loop {

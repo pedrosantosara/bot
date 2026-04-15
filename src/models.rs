@@ -294,6 +294,15 @@ pub struct BalanceInfo {
     pub available_capital: f64,
 }
 
+// ── Log entry for web viewer ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub timestamp: String,
+    pub level: String,
+    pub message: String,
+}
+
 // ── WebSocket event types ──
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,4 +313,5 @@ pub enum WsEvent {
     StatsUpdate(TradeStats),
     BotStatusChanged(BotStatus),
     BalanceUpdate(BalanceInfo),
+    LogEntry(LogEntry),
 }

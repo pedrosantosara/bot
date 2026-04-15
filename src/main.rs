@@ -17,6 +17,8 @@ use axum::{routing::{delete, get, post, put}, Router};
 use clap::{Parser, Subcommand};
 use tower_http::cors::CorsLayer;
 use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::db::Database;
 use crate::web::state::AppState;
@@ -60,23 +62,29 @@ async fn main() -> Result<()> {
 
     let _ = dotenvy::dotenv();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
-
     let cli = Cli::parse();
 
     let http_client = api::build_http_client()
         .context("Failed to create HTTP client")?;
 
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
     match cli.command.unwrap_or(Commands::Serve) {
         Commands::Serve => {
             let db = Database::connect(&cli.database_url).await?;
             let state = AppState::new(db, http_client);
+
+            // Init tracing with web log layer so logs stream to the frontend
+            let log_layer = web::log_layer::WebLogLayer::new(
+                state.clone(),
+                tokio::runtime::Handle::current(),
+            );
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_subscriber::fmt::layer().with_target(false))
+                .with(log_layer)
+                .init();
 
             // Build API router
             let api_router = Router::new()
@@ -144,6 +152,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::Discover { category, period, limit } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_target(false)
+                .init();
             let data_api = api::data::DataApi::new(http_client, "https://data-api.polymarket.com");
             let entries = data_api.get_leaderboard(&category, &period, "PNL", limit).await?;
 
