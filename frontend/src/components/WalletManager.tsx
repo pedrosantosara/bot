@@ -88,31 +88,33 @@ export function WalletManager({ onAnalyze }: { onAnalyze?: (wallet: string) => v
       </div>
 
       {/* Add wallet form */}
-      <div className="flex gap-2">
+      <div className="flex flex-col sm:flex-row gap-2">
         <input
           value={newAddr} onChange={e => setNewAddr(e.target.value)}
           placeholder="0x... wallet address"
           className="flex-1 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-sm font-mono focus:border-blue-500 outline-none"
         />
-        <input
-          value={newLabel} onChange={e => setNewLabel(e.target.value)}
-          placeholder="Label (optional)"
-          className="w-40 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 outline-none"
-        />
-        <button onClick={handleAdd} className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 rounded-lg text-white text-sm font-medium">
-          Add
-        </button>
+        <div className="flex gap-2">
+          <input
+            value={newLabel} onChange={e => setNewLabel(e.target.value)}
+            placeholder="Label"
+            className="flex-1 sm:w-32 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 outline-none"
+          />
+          <button onClick={handleAdd} className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 rounded-lg text-white text-sm font-medium shrink-0">
+            Add
+          </button>
+        </div>
       </div>
 
       {/* Wallet list */}
       <div className="space-y-1">
         {wallets.map(wal => (
-          <div key={wal.id} className="flex items-center justify-between bg-zinc-900 border border-zinc-800 rounded-lg px-4 py-3">
-            <div className="flex items-center gap-3">
-              <div className={`w-2 h-2 rounded-full ${wal.enabled ? 'bg-emerald-400' : 'bg-zinc-600'}`} />
-              <span className="font-mono text-sm">{wal.address.slice(0, 10)}...{wal.address.slice(-4)}</span>
-              {wal.label && <span className="text-zinc-500 text-sm">{wal.label}</span>}
-              <span className="text-emerald-400 text-sm font-mono">+${wal.pnl?.toFixed(0)}</span>
+          <div key={wal.id} className="flex flex-col sm:flex-row sm:items-center justify-between bg-zinc-900 border border-zinc-800 rounded-lg px-3 sm:px-4 py-2.5 sm:py-3 gap-2">
+            <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+              <div className={`w-2 h-2 rounded-full shrink-0 ${wal.enabled ? 'bg-emerald-400' : 'bg-zinc-600'}`} />
+              <span className="font-mono text-xs sm:text-sm truncate">{wal.address.slice(0, 8)}...{wal.address.slice(-4)}</span>
+              {wal.label && <span className="text-zinc-500 text-xs sm:text-sm truncate hidden sm:inline">{wal.label}</span>}
+              <span className="text-emerald-400 text-xs sm:text-sm font-mono shrink-0">+${wal.pnl?.toFixed(0)}</span>
             </div>
             <div className="flex gap-2">
               {onAnalyze && (

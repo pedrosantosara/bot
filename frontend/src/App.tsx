@@ -134,15 +134,15 @@ export default function App() {
       )}
 
       {/* Header */}
-      <header className="border-b border-zinc-800 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <h1 className="text-xl font-bold text-white tracking-tight">
-              Polymarket CopyBot
+      <header className="border-b border-zinc-800 px-4 sm:px-6 py-3 sm:py-4">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <h1 className="text-lg sm:text-xl font-bold text-white tracking-tight">
+              CopyBot
             </h1>
             <div className="flex items-center gap-1.5 text-xs">
               <div className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-emerald-400' : 'bg-red-400'}`} />
-              <span className="text-zinc-500">{connected ? 'WS Connected' : 'Disconnected'}</span>
+              <span className="text-zinc-500">{connected ? 'Live' : 'Off'}</span>
             </div>
           </div>
           <BotControl status={botStatus} onUpdate={loadData} onStop={handleStopBot} />
@@ -151,42 +151,42 @@ export default function App() {
 
       {/* Balance bar */}
       {balance && (
-        <div className="border-b border-zinc-800 px-6 py-2 bg-zinc-900/50">
-          <div className="max-w-7xl mx-auto flex items-center gap-6 text-sm">
+        <div className="border-b border-zinc-800 px-4 sm:px-6 py-2 bg-zinc-900/50">
+          <div className="max-w-7xl mx-auto grid grid-cols-3 sm:flex sm:items-center gap-x-4 gap-y-1 sm:gap-6 text-xs sm:text-sm">
             <div>
-              <span className="text-zinc-500">Capital: </span>
-              <span className="font-mono font-bold">${balance.initial_capital?.toFixed(2)}</span>
+              <span className="text-zinc-500">Capital </span>
+              <span className="font-mono font-bold">${balance.initial_capital?.toFixed(0)}</span>
             </div>
             <div>
-              <span className="text-zinc-500">Balance: </span>
-              <span className="font-mono font-bold">${balance.current_balance?.toFixed(2)}</span>
+              <span className="text-zinc-500">Balance </span>
+              <span className="font-mono font-bold">${balance.current_balance?.toFixed(0)}</span>
             </div>
             <div>
-              <span className="text-zinc-500">P&L: </span>
+              <span className="text-zinc-500">P&L </span>
               <span className={`font-mono font-bold ${balance.total_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                {balance.total_pnl >= 0 ? '+' : ''}${balance.total_pnl?.toFixed(2)} ({balance.pnl_pct >= 0 ? '+' : ''}{balance.pnl_pct?.toFixed(2)}%)
+                {balance.total_pnl >= 0 ? '+' : ''}${balance.total_pnl?.toFixed(2)}
               </span>
             </div>
             <div>
-              <span className="text-zinc-500">Open: </span>
-              <span className="font-mono text-amber-400">${balance.open_positions_value?.toFixed(2)}</span>
+              <span className="text-zinc-500">Open </span>
+              <span className="font-mono text-amber-400">${balance.open_positions_value?.toFixed(0)}</span>
             </div>
             <div>
-              <span className="text-zinc-500">Available: </span>
-              <span className="font-mono">${balance.available_capital?.toFixed(2)}</span>
+              <span className="text-zinc-500">Free </span>
+              <span className="font-mono">${balance.available_capital?.toFixed(0)}</span>
             </div>
           </div>
         </div>
       )}
 
       {/* Tabs */}
-      <nav className="border-b border-zinc-800 px-6">
-        <div className="max-w-7xl mx-auto flex gap-0">
+      <nav className="border-b border-zinc-800 px-2 sm:px-6 overflow-x-auto scrollbar-hide">
+        <div className="max-w-7xl mx-auto flex gap-0 min-w-max sm:min-w-0">
           {tabs.map(t => (
             <button
               key={t.id}
               onClick={() => setTab(t.id)}
-              className={`px-5 py-3 text-sm font-medium border-b-2 transition-colors ${
+              className={`px-3 sm:px-5 py-3 text-xs sm:text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
                 tab === t.id
                   ? 'border-blue-500 text-white'
                   : 'border-transparent text-zinc-500 hover:text-zinc-300'
@@ -199,7 +199,7 @@ export default function App() {
       </nav>
 
       {/* Content */}
-      <main className="max-w-7xl mx-auto px-6 py-6 space-y-6">
+      <main className="max-w-7xl mx-auto px-3 sm:px-6 py-4 sm:py-6 space-y-4 sm:space-y-6">
         {tab === 'dashboard' && (
           <>
             <StatsCards stats={stats} />

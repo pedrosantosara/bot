@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use axum::{middleware, routing::{delete, get, post, put}, Router};
 use clap::{Parser, Subcommand};
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::web::auth;
 use tracing::info;
@@ -130,10 +131,22 @@ async fn main() -> Result<()> {
                 .route("/api/login", post(auth::login))
                 .with_state(auth_state);
 
+            // Serve frontend static files — try ./frontend/dist, then ./frontend-dist
+            let frontend_dir = if std::path::Path::new("./frontend/dist/index.html").exists() {
+                "./frontend/dist"
+            } else if std::path::Path::new("./frontend-dist/index.html").exists() {
+                "./frontend-dist"
+            } else {
+                "./frontend/dist"
+            };
+            let serve_frontend = ServeDir::new(frontend_dir)
+                .not_found_service(ServeFile::new(format!("{}/index.html", frontend_dir)));
+
             let app = Router::new()
                 .nest("/api", api_router)
                 .merge(login_router)
                 .route("/ws", get(web::ws::ws_handler))
+                .fallback_service(serve_frontend)
                 .layer(CorsLayer::permissive())
                 .with_state(state.clone());
 
