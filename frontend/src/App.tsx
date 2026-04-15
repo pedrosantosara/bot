@@ -14,10 +14,6 @@ type Tab = 'dashboard' | 'analyze' | 'history' | 'logs' | 'settings'
 
 export default function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem('bot_token'))
-
-  if (!token) {
-    return <Login onLogin={(t) => setToken(t)} />
-  }
   const [tab, setTab] = useState<Tab>('dashboard')
   const [stats, setStats] = useState<any>(null)
   const [balance, setBalance] = useState<any>(null)
@@ -65,7 +61,11 @@ export default function App() {
     }
   }
 
-  useEffect(() => { loadData() }, [])
+  useEffect(() => { if (token) loadData() }, [token])
+
+  if (!token) {
+    return <Login onLogin={(t) => setToken(t)} />
+  }
 
   const handleStopBot = async () => {
     try {

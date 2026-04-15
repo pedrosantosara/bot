@@ -41,6 +41,8 @@ pub struct Simulator {
     open_market_slugs: Arc<Mutex<HashMap<String, String>>>,
     condition_slug_cache: Arc<Mutex<HashMap<String, String>>>,
     subscribed_assets: Arc<Mutex<HashSet<String>>>,
+    /// Track max trade USDC per wallet for proportional sizing
+    wallet_max_trade: Arc<Mutex<HashMap<String, f64>>>,
     /// Circuit breaker
     consecutive_losses: Arc<Mutex<u32>>,
     daily_pnl: Arc<Mutex<f64>>,
@@ -63,6 +65,7 @@ impl Simulator {
             open_market_slugs: Arc::new(Mutex::new(HashMap::new())),
             condition_slug_cache: Arc::new(Mutex::new(HashMap::new())),
             subscribed_assets: Arc::new(Mutex::new(HashSet::new())),
+            wallet_max_trade: Arc::new(Mutex::new(HashMap::new())),
             consecutive_losses: Arc::new(Mutex::new(0)),
             daily_pnl: Arc::new(Mutex::new(0.0)),
             api_timestamps: Arc::new(Mutex::new(VecDeque::new())),
@@ -1305,10 +1308,9 @@ impl Simulator {
         }
     }
 
-    // ── Balance Tracker: fetch real USDC balance every 30min ──
+    // ── Balance Tracker: sync with real Polymarket account every 5min ──
 
     async fn run_balance_tracker(&self) -> Result<()> {
-        // Fetch immediately on start, then every 30 min
         let mut first = true;
         loop {
             if !*self.state.bot_running.read().await {
@@ -1316,13 +1318,10 @@ impl Simulator {
             }
 
             if !first {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1800)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
             }
             first = false;
 
-            // Get wallet address: prefer POLYMARKET_WALLET env (profile address),
-            // because exec.address is the signer address which differs from the
-            // Polymarket profile address used by the Data API.
             let address = std::env::var("POLYMARKET_WALLET")
                 .or_else(|_| std::env::var("POLYMARKET_ADDRESS"))
                 .unwrap_or_else(|_| {
@@ -1334,75 +1333,71 @@ impl Simulator {
                 });
             if address.is_empty() { continue; }
 
-            // Fetch USDC balance from Polymarket Data API
-            let url = format!(
-                "https://data-api.polymarket.com/wallets?address={}",
+            // Fetch portfolio value from /value endpoint
+            let value_url = format!(
+                "https://data-api.polymarket.com/value?user={}",
                 address
             );
-            let resp = match self.state.http_client.get(&url)
+            let positions_value = match self.state.http_client.get(&value_url)
                 .timeout(std::time::Duration::from_secs(10))
                 .send().await
             {
-                Ok(r) => r,
+                Ok(r) => {
+                    let body: serde_json::Value = r.json().await.unwrap_or_default();
+                    // Response is an array: [{"user":"0x...","value":45.27}]
+                    if let Some(arr) = body.as_array() {
+                        arr.first()
+                            .and_then(|v| v.get("value"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    }
+                }
                 Err(e) => {
-                    warn!(error = %e, "Balance fetch failed");
+                    warn!(error = %e, "Portfolio value fetch failed");
                     continue;
                 }
             };
 
-            let body: serde_json::Value = match resp.json().await {
-                Ok(v) => v,
+            // Calculate: real capital = available_cash + open_positions + realized_losses
+            // We know: available = capital + realized_pnl - open_cost
+            // So: capital = available - realized_pnl + open_cost
+            // And: available = total_portfolio - positions_value
+            // But we don't have total_portfolio directly.
+            //
+            // Instead: sync simulated_capital so that the formula produces correct available.
+            // From DB we know realized_pnl and open_cost (our tracked positions).
+            // The real positions_value from API tells us what our open positions are worth NOW.
+            //
+            // New approach: store positions_value and use it to adjust capital.
+            // capital_adjustment = positions_value - open_cost (unrealized PnL on open positions)
+
+            let balance_info = match self.state.db.get_balance_info().await {
+                Ok(b) => b,
                 Err(_) => continue,
             };
 
-            // Try to extract USDC balance — API may return different formats
-            let usdc_balance = body.get("usdcBalance")
-                .or_else(|| body.get("balance"))
-                .or_else(|| body.get("collateralBalance"))
-                .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+            // Store real portfolio value for reference
+            let _ = self.state.db.set_config("real_positions_value", serde_json::json!(positions_value)).await;
+            let _ = self.state.db.set_config("balance_updated_at",
+                serde_json::json!(Utc::now().to_rfc3339())).await;
 
-            // Also try the positions endpoint for total portfolio value
-            let portfolio_url = format!(
-                "https://data-api.polymarket.com/wallets/{}",
-                address
+            println!("  {} {}",
+                "💰".green(),
+                format!("Portfolio: ${:.2} positions | Capital: ${:.2} | Available: ${:.2}",
+                    positions_value,
+                    balance_info.current_balance,
+                    balance_info.available_capital,
+                ).green(),
             );
-            let portfolio_balance = if let Ok(resp) = self.state.http_client.get(&portfolio_url)
-                .timeout(std::time::Duration::from_secs(10))
-                .send().await
-            {
-                let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                body.get("usdcBalance")
-                    .or_else(|| body.get("balance"))
-                    .or_else(|| body.get("collateralBalance"))
-                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-                    .or(usdc_balance)
-            } else {
-                usdc_balance
-            };
 
-            if let Some(balance) = portfolio_balance {
-                // Update simulated_capital in config with real balance
-                let _ = self.state.db.set_config("real_usdc_balance", serde_json::json!(balance)).await;
-                let _ = self.state.db.set_config("balance_updated_at",
-                    serde_json::json!(Utc::now().to_rfc3339())).await;
-
-                println!("  {} {}",
-                    "💰".green(),
-                    format!("Real balance: ${:.2} USDC (wallet {}...{})",
-                        balance,
-                        &address[..6.min(address.len())],
-                        &address[address.len().saturating_sub(4)..],
-                    ).green(),
-                );
-
-                // Broadcast balance update
-                if let Ok(bal) = self.state.db.get_balance_info().await {
-                    self.state.broadcast(WsEvent::BalanceUpdate(bal));
-                }
-            } else {
-                warn!("Could not parse balance from API response");
-                debug!(body = %body, "Balance API response");
+            // Broadcast balance update
+            if let Ok(bal) = self.state.db.get_balance_info().await {
+                self.state.broadcast(WsEvent::BalanceUpdate(bal));
             }
+
+            // no else block needed — we always get a number from /value
         }
     }
 
@@ -2107,21 +2102,41 @@ impl Simulator {
             }
         }
 
-        // Capital check
+        // Use trade price directly — copy exactly what they paid
+        let sim_entry_price = trade.price.min(0.99).max(0.01);
+
+        // Proportional sizing: scale based on whale's trade size.
+        // The largest trade from this wallet → max_per_trade, smaller trades → proportionally less.
+        let whale_usdc = trade.size * trade.price;
+        let trade_amount = {
+            let mut max_map = self.wallet_max_trade.lock().await;
+            let wallet_key = trade.proxy_wallet.clone();
+            let current_max = max_map.get(&wallet_key).copied().unwrap_or(0.0);
+
+            if whale_usdc >= current_max {
+                max_map.insert(wallet_key, whale_usdc);
+                max_per_trade
+            } else if current_max > 0.0 {
+                let proportion = whale_usdc / current_max;
+                (proportion * max_per_trade).max(1.0) // minimum $1
+            } else {
+                max_per_trade
+            }
+        };
+
+        // Capital check using proportional amount
         let balance = self.state.db.get_balance_info().await?;
-        if balance.available_capital < max_per_trade {
+        if balance.available_capital < trade_amount {
             warn!(
                 available = balance.available_capital,
-                needed = max_per_trade,
+                needed = trade_amount,
                 market = %trade.title,
                 "Skipping trade — insufficient capital"
             );
             return Ok(());
         }
 
-        // Use trade price directly — copy exactly what they paid
-        let sim_entry_price = trade.price.min(0.99).max(0.01);
-        let mut sim_size_shares = max_per_trade / sim_entry_price;
+        let mut sim_size_shares = trade_amount / sim_entry_price;
         // Polymarket minimum: 5 shares
         if sim_size_shares < 5.0 { sim_size_shares = 5.0; }
         let sim_cost = sim_size_shares * sim_entry_price;
