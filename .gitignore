@@ -4,3 +4,4 @@
 /data
 .env
 *.db
+LightsailDefaultKey-eu-west-1.pem
